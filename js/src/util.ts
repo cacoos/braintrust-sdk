@@ -13,6 +13,7 @@ export function runCatchFinally<R>(
     const ret = f();
     if (ret instanceof Promise) {
       runSyncCleanup = false;
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions, @typescript-eslint/no-explicit-any
       return (ret as any).catch(catchF).finally(finallyF) as R;
     } else {
       return ret;
@@ -41,6 +42,7 @@ export function isEmpty(a: unknown): a is null | undefined {
 // immediately consumes what is returned by `LazyValue.value()`).
 export class LazyValue<T> {
   private callable: () => Promise<T>;
+  private resolvedValue: T | undefined = undefined;
   private value:
     | { computedState: "succeeded"; val: Promise<T> }
     | { computedState: "in_progress"; val: Promise<T> }
@@ -68,10 +70,18 @@ export class LazyValue<T> {
       computedState: "in_progress",
       val: this.callable().then((x) => {
         this.value.computedState = "succeeded";
+        this.resolvedValue = x; // Store the resolved value
         return x;
       }),
     };
     return this.value.val;
+  }
+
+  getSync(): { resolved: boolean; value: T | undefined } {
+    return {
+      resolved: this.value.computedState === "succeeded",
+      value: this.resolvedValue,
+    };
   }
 
   // If this is true, the caller should be able to obtain the LazyValue without
@@ -127,4 +137,19 @@ export class InternalAbortError extends Error {
     super(message);
     this.name = "InternalAbortError";
   }
+}
+
+// Return a copy of record with the given keys removed.
+export function filterFrom(record: Record<string, any>, keys: string[]) {
+  const out: Record<string, any> = {};
+  for (const k of Object.keys(record)) {
+    if (!keys.includes(k)) {
+      out[k] = record[k];
+    }
+  }
+  return out;
+}
+
+export function objectIsEmpty(obj: Record<string, any>): boolean {
+  return !obj || Object.keys(obj).length === 0;
 }

@@ -47,7 +47,6 @@ import chevron
 import exceptiongroup
 import requests
 import urllib3
-from braintrust_core.serializable_data_class import SerializableDataClass
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -67,11 +66,12 @@ from .db_fields import (
 from .git_fields import GitMetadataSettings, RepoInfo
 from .gitutil import get_past_n_ancestors, get_repo_info
 from .merge_row_batch import batch_items, merge_row_batch
-from .object import DEFAULT_IS_LEGACY_DATASET, ensure_dataset_record, make_legacy_event
+from .object import DEFAULT_IS_LEGACY_DATASET, ensure_dataset_record
 from .prompt import BRAINTRUST_PARAMS, ImagePart, PromptBlockData, PromptMessage, PromptSchema, TextPart
 from .prompt_cache.disk_cache import DiskCache
 from .prompt_cache.lru_cache import LRUCache
 from .prompt_cache.prompt_cache import PromptCache
+from .serializable_data_class import SerializableDataClass
 from .span_identifier_v3 import SpanComponentsV3, SpanObjectTypeV3
 from .span_types import SpanTypeAttribute
 from .types import AttachmentReference, AttachmentStatus, DatasetEvent, ExperimentEvent, PromptOptions, SpanAttributes
@@ -86,6 +86,7 @@ from .util import (
     encode_uri_component,
     eprint,
     get_caller_location,
+    mask_api_key,
     merge_dicts,
     response_raise_for_status,
 )
@@ -96,6 +97,11 @@ DATA_API_VERSION = 2
 T = TypeVar("T")
 TMapping = TypeVar("TMapping", bound=Mapping[str, Any])
 TMutableMapping = TypeVar("TMutableMapping", bound=MutableMapping[str, Any])
+
+
+TEST_API_KEY = "___TEST_API_KEY__"
+
+DEFAULT_APP_URL = "https://www.braintrust.dev"
 
 
 class Exportable(ABC):
@@ -167,11 +173,30 @@ class Span(Exportable, contextlib.AbstractContextManager, ABC):
         """
 
     @abstractmethod
+    def link(self) -> str:
+        """
+        Format a link to the Braintrust application for viewing this span.
+
+        Links can be generated at any time, but they will only become viewable
+        after the span and its root have been flushed to the server and ingested.
+
+        There are some conditions when a Span doesn't have enough information
+        to return a stable link (e.g. during an unresolved experiment). In this case
+        or if there's an error generating link, we'll return a placeholder link.
+
+        :returns: A link to the span.
+        """
+
+    @abstractmethod
     def permalink(self) -> str:
         """
         Format a permalink to the Braintrust application for viewing this span.
 
         Links can be generated at any time, but they will only become viewable after the span and its root have been flushed to the server and ingested.
+
+        This function can block resolving data with the server. For production
+        applications it's preferable to call `Span.link` instead.
+
 
         :returns: A permalink to the span.
         """
@@ -246,6 +271,9 @@ class _NoopSpan(Span):
     def export(self):
         return ""
 
+    def link(self) -> str:
+        return NOOP_SPAN_PERMALINK
+
     def permalink(self) -> str:
         return NOOP_SPAN_PERMALINK
 
@@ -276,7 +304,7 @@ class _NoopSpan(Span):
 
 
 NOOP_SPAN: Span = _NoopSpan()
-NOOP_SPAN_PERMALINK = "https://braintrust.dev/noop-span"
+NOOP_SPAN_PERMALINK = "https://www.braintrust.dev/noop-span"
 
 
 class BraintrustState:
@@ -600,9 +628,20 @@ class _MemoryBackgroundLogger(_BackgroundLogger):
         with self.lock:
             logs = [l.get() for l in self.logs]  # unwrap the LazyValues
             self.logs = []
+
+            if not logs:
+                return []
+
             # all the logs get merged before gettig sent to the server, so simulate that
             # here
-            return merge_row_batch(logs)
+            merged = merge_row_batch(logs)
+            first = merged[0]
+            for other in merged[1:]:
+                first.extend(other)
+            return first
+
+
+BACKGROUND_LOGGER_BASE_SLEEP_TIME_S = 1.0
 
 
 # We should only have one instance of this object in
@@ -815,7 +854,9 @@ class _HTTPBackgroundLogger:
                     print(errmsg, file=self.outfile)
                     traceback.print_exc(file=self.outfile)
                     if is_retrying:
-                        time.sleep(0.1)
+                        sleep_time_s = BACKGROUND_LOGGER_BASE_SLEEP_TIME_S * (2**i)
+                        print(f"Sleeping for {sleep_time_s}s", file=self.outfile)
+                        time.sleep(sleep_time_s)
 
         print(
             f"Failed to construct log records to flush after {self.num_tries} attempts. Dropping batch",
@@ -831,9 +872,6 @@ class _HTTPBackgroundLogger:
         for i in range(self.num_tries):
             start_time = time.time()
             resp = conn.post("/logs3", data=dataStr)
-            if not resp.ok:
-                legacyDataS = construct_json_array([json.dumps(make_legacy_event(json.loads(r))) for r in items])
-                resp = conn.post("/logs", data=legacyDataS)
             if resp.ok:
                 return
             resp_errmsg = f"{resp.status_code}: {resp.text}"
@@ -853,7 +891,9 @@ class _HTTPBackgroundLogger:
             else:
                 print(errmsg, file=self.outfile)
                 if is_retrying:
-                    time.sleep(0.1)
+                    sleep_time_s = BACKGROUND_LOGGER_BASE_SLEEP_TIME_S * (2**i)
+                    print(f"Sleeping for {sleep_time_s}s", file=self.outfile)
+                    time.sleep(sleep_time_s)
 
         print(f"log request failed after {self.num_tries} retries. Dropping batch", file=self.outfile)
 
@@ -1283,6 +1323,13 @@ def init_logger(
 
     compute_metadata_args = dict(project_name=project, project_id=project_id)
 
+    link_args = {
+        "app_url": app_url,
+        "org_name": org_name,
+        "project_name": project,
+        "project_id": project_id,
+    }
+
     def compute_metadata():
         login(org_name=org_name, api_key=api_key, app_url=app_url, force_login=force_login)
         return _compute_logger_metadata(**compute_metadata_args)
@@ -1291,6 +1338,7 @@ def init_logger(
         lazy_metadata=LazyValue(compute_metadata, use_mutex=True),
         async_flush=async_flush,
         compute_metadata_args=compute_metadata_args,
+        link_args=link_args,
     )
     if set_current:
         _state.current_logger = ret
@@ -1399,6 +1447,8 @@ def login(
     :param org_name: (Optional) The name of a specific organization to connect to. This is useful if you belong to multiple.
     :param force_login: Login again, even if you have already logged in (by default, this function will exit quickly if you have already logged in)
     """
+    # FIXME[matt] Remove thrown exceptions from this method. Perhaps a better pattern is (is_success, message) = login()
+    # to guarantee we don't throw into userland.
 
     global _state
 
@@ -1414,39 +1464,49 @@ def login(
                         f"Re-logging in with different {varname} ({arg}) than original ({orig}). To force re-login, pass `force_login=True`"
                     )
 
+            sanitized_api_key = HTTPConnection.sanitize_token(api_key) if api_key else None
             check_updated_param("app_url", app_url, _state.app_url)
-            check_updated_param(
-                "api_key", HTTPConnection.sanitize_token(api_key) if api_key else None, _state.login_token
-            )
+            check_updated_param("api_key", sanitized_api_key, _state.login_token)
             check_updated_param("org_name", org_name, _state.org_name)
             return
 
-        if app_url is None:
-            app_url = os.environ.get("BRAINTRUST_APP_URL", "https://www.braintrust.dev")
+        app_url = _get_app_url(app_url)
 
         app_public_url = os.environ.get("BRAINTRUST_APP_PUBLIC_URL", app_url)
 
         if api_key is None:
             api_key = os.environ.get("BRAINTRUST_API_KEY")
 
-        if org_name is None:
-            org_name = os.environ.get("BRAINTRUST_ORG_NAME")
+        org_name = _get_org_name(org_name)
 
         _state.reset_login_info()
 
         _state.app_url = app_url
         _state.app_public_url = app_public_url
+        _state.org_name = org_name
 
         conn = None
-        if api_key is not None:
+        if api_key == TEST_API_KEY:
+            # a small hook for pseudo-logins
+            test_org_info = [
+                {
+                    "id": "test-org-id",
+                    "name": org_name or "test-org-name",
+                    "api_url": "https://api.braintrust.ai",
+                    "proxy_url": "https://proxy.braintrust.ai",
+                }
+            ]
+            _check_org_info(test_org_info, org_name)
+            _state.login_token = TEST_API_KEY
+            _state.logged_in = True
+            return
+        elif api_key is not None:
             app_conn = HTTPConnection(_state.app_url, adapter=_http_adapter)
             app_conn.set_token(api_key)
             resp = app_conn.post("api/apikey/login")
             if not resp.ok:
-                api_key_prefix = (
-                    (" (" + api_key[:2] + "*" * (len(api_key) - 4) + api_key[-2:] + ")") if len(api_key) > 4 else ""
-                )
-                raise ValueError(f"Invalid API key{api_key_prefix}: [{resp.status_code}] {resp.text}")
+                masked_api_key = mask_api_key(api_key)
+                raise ValueError(f"Invalid API key {masked_api_key}: [{resp.status_code}] {resp.text}")
             info = resp.json()
 
             _check_org_info(info["org_info"], org_name)
@@ -1454,7 +1514,8 @@ def login(
             if not _state.api_url:
                 if org_name:
                     raise ValueError(
-                        f"Unable to log into organization '{org_name}'. Are you sure this credential is scoped to the organization?"
+                        f"Unable to log into organization '{org_name}'."
+                        " Are you sure this credential is scoped to the organization?"
                     )
                 else:
                     raise ValueError("Unable to log into any organization with the provided credential.")
@@ -1471,10 +1532,15 @@ def login(
         # this point because we know the connection _can_ successfully ping.
         conn.make_long_lived()
 
+        # Same for the app conn, which we know is valid because we have
+        # successfully logged in.
+        _state.app_conn().make_long_lived()
+
         # Set the same token in the API
         _state.app_conn().set_token(conn.token)
         if _state.proxy_url:
             _state.proxy_conn().set_token(conn.token)
+            _state.proxy_conn().make_long_lived()
         _state.login_token = conn.token
         _state.logged_in = True
 
@@ -1635,7 +1701,20 @@ def traced(*span_args: Any, **span_kwargs: Any) -> Callable[[F], F]:
                     _try_log_output(span, ret)
                 return ret
 
-        if bt_iscoroutinefunction(f):
+        @wraps(f)
+        async def wrapper_async_gen(*f_args, **f_kwargs):
+            with start_span(*span_args, **span_kwargs) as span:
+                if trace_io:
+                    _try_log_input(span, f_sig, f_args, f_kwargs)
+                async_gen = f(*f_args, **f_kwargs)
+                async for value in async_gen:
+                    yield value
+                # NOTE[matt] i'm disabling output tracing (e.g notrace_io=False) for async generators
+                # because an async generator could be infinite and make us OOM.
+
+        if inspect.isasyncgenfunction(f):
+            return cast(F, wrapper_async_gen)
+        elif bt_iscoroutinefunction(f):
             return cast(F, wrapper_async)
         else:
             return cast(F, wrapper_sync)
@@ -2052,59 +2131,48 @@ class ObjectFetcher(ABC, Generic[TMapping]):
     def _refetch(self) -> List[TMapping]:
         state = self._get_state()
         if self._fetched_data is None:
-            if self._internal_btql is not None:
-                cursor = None
-                data = None
-                iterations = 0
-                while True:
-                    resp = state.api_conn().post(
-                        f"btql",
-                        json={
-                            "query": {
-                                **self._internal_btql,
-                                "select": [{"op": "star"}],
-                                "from": {
-                                    "op": "function",
-                                    "name": {
-                                        "op": "ident",
-                                        "name": [self.object_type],
-                                    },
-                                    "args": [
-                                        {
-                                            "op": "literal",
-                                            "value": self.id,
-                                        },
-                                    ],
+            cursor = None
+            data = None
+            iterations = 0
+            while True:
+                resp = state.api_conn().post(
+                    f"btql",
+                    json={
+                        "query": {
+                            **(self._internal_btql or {}),
+                            "select": [{"op": "star"}],
+                            "from": {
+                                "op": "function",
+                                "name": {
+                                    "op": "ident",
+                                    "name": [self.object_type],
                                 },
-                                "cursor": cursor,
-                                "limit": INTERNAL_BTQL_LIMIT,
+                                "args": [
+                                    {
+                                        "op": "literal",
+                                        "value": self.id,
+                                    },
+                                ],
                             },
+                            "cursor": cursor,
+                            "limit": INTERNAL_BTQL_LIMIT,
                         },
-                        headers={
-                            "Accept-Encoding": "gzip",
-                        },
-                    )
-                    response_raise_for_status(resp)
-                    resp_json = resp.json()
-                    data = (data or []) + cast(List[TMapping], resp_json["data"])
-                    if not resp_json.get("cursor", None):
-                        break
-                    cursor = resp_json.get("cursor", None)
-                    iterations += 1
-                    if iterations > MAX_BTQL_ITERATIONS:
-                        raise RuntimeError("Too many BTQL iterations")
-            else:
-                resp = state.api_conn().get(
-                    f"v1/{self.object_type}/{self.id}/fetch",
-                    params={
-                        "version": self._pinned_version,
+                        "use_columnstore": False,
+                        "brainstore_realtime": True,
                     },
                     headers={
                         "Accept-Encoding": "gzip",
                     },
                 )
                 response_raise_for_status(resp)
-                data = cast(List[TMapping], resp.json()["events"])
+                resp_json = resp.json()
+                data = (data or []) + cast(List[TMapping], resp_json["data"])
+                if not resp_json.get("cursor", None):
+                    break
+                cursor = resp_json.get("cursor", None)
+                iterations += 1
+                if iterations > MAX_BTQL_ITERATIONS:
+                    raise RuntimeError("Too many BTQL iterations")
 
             if not isinstance(data, list):
                 raise ValueError(f"Expected a list in the response, got {type(data)}")
@@ -2615,29 +2683,35 @@ def permalink(slug: str, org_name: Optional[str] = None, app_url: Optional[str] 
         # Noop spans have an empty slug, so return a dummy permalink.
         return NOOP_SPAN_PERMALINK
 
-    if not org_name:
-        login()
-        if not _state.org_name:
-            raise Exception("Must either provide org_name explicitly or be logged in to a specific org")
-        org_name = _state.org_name
+    try:
+        if not org_name:
+            login()
+            if not _state.org_name:
+                raise Exception("Must either provide org_name explicitly or be logged in to a specific org")
+            org_name = _state.org_name
 
-    if not app_url:
-        login()
-        if not _state.app_url:
-            raise Exception("Must either provide app_url explicitly or be logged in")
-        app_url = _state.app_url
+        if not app_url:
+            login()
+            if not _state.app_url:
+                raise Exception("Must either provide app_url explicitly or be logged in")
+            app_url = _state.app_url
 
-    components = SpanComponentsV3.from_str(slug)
+        components = SpanComponentsV3.from_str(slug)
 
-    object_type = str(components.object_type)
-    object_id = span_components_to_object_id(components)
-    id = components.row_id
+        object_type = str(components.object_type)
+        object_id = span_components_to_object_id(components)
+        id = components.row_id
 
-    if not id:
-        raise ValueError("Span slug does not refer to an individual row")
+        if not id:
+            raise ValueError("Span slug does not refer to an individual row")
 
-    url_params = urlencode({"object_type": object_type, "object_id": object_id, "id": id})
-    return f"{app_url}/app/{org_name}/object?{url_params}"
+        url_params = urlencode({"object_type": object_type, "object_id": object_id, "id": id})
+        return f"{app_url}/app/{org_name}/object?{url_params}"
+    except Exception as e:
+        if "BRAINTRUST_API_KEY" in str(e):
+            return _get_error_link("login-or-provide-org-name")
+        else:
+            return _get_error_link()
 
 
 def _start_span_parent_args(
@@ -2964,14 +3038,21 @@ class Experiment(ObjectFetcher[ExperimentEvent], Exportable):
                     comparison_experiment_id = base_experiment.id
                     comparison_experiment_name = base_experiment.name
 
-            summary_items = state.api_conn().get_json(
-                "experiment-comparison2",
-                args={
-                    "experiment_id": self.id,
-                    "base_experiment_id": comparison_experiment_id,
-                },
-                retries=3,
-            )
+            try:
+                summary_items = state.api_conn().get_json(
+                    "experiment-comparison2",
+                    args={
+                        "experiment_id": self.id,
+                        "base_experiment_id": comparison_experiment_id,
+                    },
+                    retries=3,
+                )
+            except Exception as e:
+                _logger.warning(
+                    f"Failed to fetch experiment scores and metrics: {e}\n\nView complete results in Braintrust or run experiment.summarize() again."
+                )
+                summary_items = {}
+
             score_items = summary_items.get("scores", {})
             metric_items = summary_items.get("metrics", {})
 
@@ -3316,8 +3397,47 @@ class SpanImpl(Span):
             propagated_event=self.propagated_event,
         ).to_str()
 
+    def link(self) -> str:
+        parent_type, info = self._get_parent_info()
+        if parent_type == SpanObjectTypeV3.PROJECT_LOGS:
+            cur_logger = _state.current_logger
+            if not cur_logger:
+                return NOOP_SPAN_PERMALINK
+            base_url = cur_logger._get_link_base_url()
+            if not base_url:
+                return _get_error_link("login-or-provide-org-name")
+
+            project_id = info.get("id")
+            project_name = info.get("name")
+            if project_id:
+                return f"{base_url}/object?object_type=project_logs&object_id={project_id}&id={self._id}"
+            elif project_name:
+                return f"{base_url}/p/{project_name}/logs?oid={self._id}"
+            else:
+                return _get_error_link("no-project-id-or-name")
+        elif parent_type == SpanObjectTypeV3.EXPERIMENT:
+            app_url = _state.app_url or _get_app_url()
+            org_name = _state.org_name or _get_org_name()
+            if not app_url or not org_name:
+                return _get_error_link("provide-app-url-or-org-name")
+            base_url = f"{app_url}/app/{org_name}"
+
+            exp_id = info.get("id")
+            if exp_id:
+                return f"{base_url}/object?object_type=experiment&object_id={exp_id}&id={self._id}"
+            else:
+                return _get_error_link("resolve-experiment-id")
+
+        return NOOP_SPAN_PERMALINK
+
     def permalink(self) -> str:
-        return permalink(self.export())
+        try:
+            return permalink(self.export())
+        except Exception as e:
+            if "BRAINTRUST_API_KEY" in str(e):
+                return _get_error_link("login-or-provide-org-name")
+            else:
+                return _get_error_link("")
 
     def close(self, end_time=None) -> float:
         return self.end(end_time)
@@ -3341,6 +3461,29 @@ class SpanImpl(Span):
                 _state.current_span.reset(self._context_token)
 
             self.end()
+
+    def _get_parent_info(self):
+        if self.parent_object_type == SpanObjectTypeV3.PROJECT_LOGS:
+            is_resolved, id1 = self.parent_object_id.get_sync()
+            meta = self.parent_compute_object_metadata_args or {}
+            id2 = meta.get("project_id")
+            name = meta.get("project_name")
+            _id = id1 if is_resolved else id2
+            return self.parent_object_type, {"name": name, "id": _id}
+        elif self.parent_object_type == SpanObjectTypeV3.EXPERIMENT:
+            is_resolved, experiment_id = self.parent_object_id.get_sync()
+            if is_resolved:
+                return self.parent_object_type, {"id": experiment_id}
+            return self.parent_object_type, {}
+        else:
+            return None, {}
+
+
+def log_exc_info_to_span(
+    span: Span, exc_type: Type[BaseException], exc_value: BaseException, tb: Optional[TracebackType]
+) -> None:
+    error = stringify_exception(exc_type, exc_value, tb)
+    span.log(error=error)
 
 
 def stringify_exception(exc_type: Type[BaseException], exc_value: BaseException, tb: Optional[TracebackType]) -> str:
@@ -3937,6 +4080,7 @@ class Logger(Exportable):
         lazy_metadata: LazyValue[OrgProjectMetadata],
         async_flush: bool = True,
         compute_metadata_args: Optional[Dict] = None,
+        link_args: Optional[Dict] = None,
     ):
         self._lazy_metadata = lazy_metadata
         self.async_flush = async_flush
@@ -3944,6 +4088,9 @@ class Logger(Exportable):
         self.last_start_time = time.time()
         self._lazy_id = LazyValue(lambda: self.id, use_mutex=False)
         self._called_start_span = False
+        # unresolved args about the org / project. Use these as potential
+        # fallbacks when generating links
+        self._link_args = link_args
 
     @property
     def org_id(self) -> str:
@@ -4151,6 +4298,19 @@ class Logger(Exportable):
     def __enter__(self) -> "Logger":
         return self
 
+    def _get_link_base_url(self) -> Optional[str]:
+        """Return the base of link urls (e.g. https://braintrust.dev/app/my-org-name/) if we have the info
+        otherwise return None.
+        """
+        # the url and org name can be passed into init_logger, resolved by login or provided as env variables
+        # so this resolves all of those things. It's possible we never have an org name if the user has not
+        # yet logged in and there is nothing else configured.
+        app_url = _state.app_url or self._link_args.get("app_url") or _get_app_url()
+        org_name = _state.org_name or self._link_args.get("org_name") or _get_org_name()
+        if not app_url or not org_name:
+            return None
+        return f"{app_url}/app/{org_name}"
+
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         del exc_type, exc_value, traceback
 
@@ -4331,3 +4491,19 @@ class TracedThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
             return context.run(fn, *args, **kwargs)
 
         return super().submit(wrapped_fn, *args, **kwargs)
+
+
+def _get_app_url(app_url: Optional[str] = None) -> str:
+    if app_url:
+        return app_url
+    return os.getenv("BRAINTRUST_APP_URL", DEFAULT_APP_URL)
+
+
+def _get_org_name(org_name: Optional[str] = None) -> Optional[str]:
+    if org_name:
+        return org_name
+    return os.getenv("BRAINTRUST_ORG_NAME")
+
+
+def _get_error_link(msg="") -> str:
+    return f"https://www.braintrust.dev/error-generating-link?msg={encode_uri_component(msg)}"
